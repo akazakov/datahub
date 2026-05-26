@@ -31,6 +31,7 @@ from pyiceberg.partitioning import PartitionSpec
 from pyiceberg.schema import Schema
 from pyiceberg.table import Table
 from pyiceberg.table.metadata import TableMetadataV2
+from pyiceberg.typedef import Identifier
 from pyiceberg.types import (
     BinaryType,
     BooleanType,
@@ -746,6 +747,84 @@ class MockCatalogExceptionRetrievingNamespaceProperties(MockCatalog):
         if namespace == ("generic_exception",):
             raise Exception()
         return super().load_namespace_properties(namespace)
+
+
+class MockHierarchicalCatalog:
+    """In-memory hierarchical catalog mimicking Iceberg REST `list_namespaces(parent=...)`.
+
+    `children` maps a parent tuple (or `None` for the root) to its immediate
+    child namespaces, matching how lakeFS / Polaris / Unity REST expose
+    multi-level namespace trees.
+    """
+
+    def __init__(self, children: Mapping[Optional[Identifier], List[Identifier]]):
+        self.children = children
+        self.calls: List[Optional[Identifier]] = []
+
+    def list_namespaces(self, parent: Optional[Identifier] = None) -> List[Identifier]:
+        self.calls.append(parent)
+        return list(self.children.get(parent, []))
+
+
+def test_get_namespaces_default_is_flat() -> None:
+    source = with_iceberg_source()
+    catalog = MockHierarchicalCatalog(
+        {
+            None: [("repo_a",), ("repo_b",)],
+            ("repo_a",): [("repo_a", "main")],
+            ("repo_a", "main"): [("repo_a", "main", "demo")],
+        }
+    )
+    namespaces = list(source._get_namespaces(catalog))  # type: ignore[arg-type]
+    assert namespaces == [("repo_a",), ("repo_b",)]
+    assert catalog.calls == [None]
+
+
+def test_get_namespaces_recursive_walks_tree() -> None:
+    source = with_iceberg_source(recursive_namespaces=True)
+    catalog = MockHierarchicalCatalog(
+        {
+            None: [("repo_a",), ("repo_b",)],
+            ("repo_a",): [("repo_a", "main"), ("repo_a", "dev")],
+            ("repo_a", "main"): [("repo_a", "main", "demo")],
+            ("repo_b",): [("repo_b", "main")],
+        }
+    )
+    namespaces = set(source._get_namespaces(catalog))  # type: ignore[arg-type]
+    assert namespaces == {
+        ("repo_a",),
+        ("repo_b",),
+        ("repo_a", "main"),
+        ("repo_a", "dev"),
+        ("repo_a", "main", "demo"),
+        ("repo_b", "main"),
+    }
+    # Root listed once + one call per non-leaf namespace.
+    assert None in catalog.calls
+    assert ("repo_a",) in catalog.calls
+    assert ("repo_a", "main") in catalog.calls
+
+
+def test_get_namespaces_recursive_continues_past_branch_errors() -> None:
+    source = with_iceberg_source(recursive_namespaces=True)
+
+    class FlakyCatalog(MockHierarchicalCatalog):
+        def list_namespaces(
+            self, parent: Optional[Identifier] = None
+        ) -> List[Identifier]:
+            if parent == ("repo_a",):
+                raise RESTError("transient")
+            return super().list_namespaces(parent)
+
+    catalog = FlakyCatalog(
+        {
+            None: [("repo_a",), ("repo_b",)],
+            ("repo_b",): [("repo_b", "main")],
+        }
+    )
+    namespaces = set(source._get_namespaces(catalog))  # type: ignore[arg-type]
+    # repo_a yielded itself but its subtree is unreachable; repo_b's subtree still walks.
+    assert namespaces == {("repo_a",), ("repo_b",), ("repo_b", "main")}
 
 
 def test_exception_while_listing_namespaces() -> None:

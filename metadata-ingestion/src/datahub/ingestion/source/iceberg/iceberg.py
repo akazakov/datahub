@@ -215,7 +215,10 @@ class IcebergSource(StatefulIngestionSourceBase):
         ]
 
     def _get_namespaces(self, catalog: Catalog) -> Iterable[Identifier]:
-        namespaces = catalog.list_namespaces()
+        if self.config.recursive_namespaces:
+            namespaces = self._list_namespaces_recursive(catalog)
+        else:
+            namespaces = list(catalog.list_namespaces())
         LOGGER.debug(
             f"Retrieved {len(namespaces)} namespaces, first 10: {namespaces[:10]}"
         )
@@ -229,6 +232,29 @@ class IcebergSource(StatefulIngestionSourceBase):
                 self.report.report_dropped(f"{namespace_repr}.*")
                 continue
             yield namespace
+
+    def _list_namespaces_recursive(self, catalog: Catalog) -> List[Identifier]:
+        # Iceberg REST `list_namespaces` accepts an optional `parent`. Without it
+        # we only see the top level, which on hierarchical catalogs (lakeFS,
+        # Polaris, Unity REST) misses every table below the root. Iterative DFS
+        # avoids Python's recursion limit on pathologically deep trees.
+        found: List[Identifier] = []
+        stack: List[Optional[Identifier]] = [None]
+        while stack:
+            parent = stack.pop()
+            try:
+                children = (
+                    catalog.list_namespaces(parent)
+                    if parent is not None
+                    else catalog.list_namespaces()
+                )
+            except Exception as e:
+                LOGGER.debug(f"list_namespaces(parent={parent}) failed: {e}")
+                continue
+            for ns in children:
+                found.append(ns)
+                stack.append(ns)
+        return found
 
     def _get_datasets(
         self, catalog: Catalog, namespaces: Iterable[Tuple[Identifier, str]]

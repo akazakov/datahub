@@ -113,6 +113,17 @@ class IcebergSourceConfig(StatefulIngestionConfigBase, DatasetSourceConfigMixin)
         default=AllowDenyPattern.allow_all(),
         description="Regex patterns for namespaces to filter in ingestion.",
     )
+    recursive_namespaces: bool = Field(
+        default=False,
+        description=(
+            "Walk the namespace tree recursively via the Iceberg REST `parent` "
+            "query parameter. Required for hierarchical catalogs such as lakeFS, "
+            "Polaris, and Unity REST where tables live below the top-level "
+            "namespaces. Leave disabled for flat catalogs (e.g. Glue, Hive, "
+            "Nessie) — enabling it there just adds a small number of empty "
+            "list calls."
+        ),
+    )
     user_ownership_property: Optional[str] = Field(
         default="owner",
         description="Iceberg table property to look for a `CorpUser` owner.  Can only hold a single user value.  If property has no value, no owner information will be emitted.",
