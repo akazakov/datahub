@@ -23,6 +23,7 @@ import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -60,6 +61,11 @@ public class DataHubAuthorizer implements Authorizer {
   protected final ReadWriteLock readWriteLock = new ReentrantReadWriteLock();
   protected final Lock readLock = readWriteLock.readLock();
 
+  // Monotonic version stamp incremented by PolicyRefreshRunnable after each successful refresh.
+  // Downstream caches (e.g. SearchPolicyTranslator's translated-query cache) read this to detect
+  // when the policy set may have changed without paying the per-call comparison cost.
+  protected final AtomicLong policyCacheVersion = new AtomicLong(0);
+
   private final ScheduledExecutorService refreshExecutorService =
       Executors.newScheduledThreadPool(1);
   private final PolicyRefreshRunnable policyRefreshRunnable;
@@ -87,12 +93,22 @@ public class DataHubAuthorizer implements Authorizer {
               new PolicyFetcher(entityClient),
               policyCache,
               readWriteLock.writeLock(),
-              policyFetchSize);
+              policyFetchSize,
+              policyCacheVersion);
       refreshExecutorService.scheduleAtFixedRate(
           policyRefreshRunnable, delayIntervalSeconds, refreshIntervalSeconds, TimeUnit.SECONDS);
     } else {
       policyRefreshRunnable = null;
     }
+  }
+
+  /**
+   * Returns the current monotonic policy cache version. Cache entries that depend on the policy
+   * set (translated ES queries, group-membership lookups) should pair their keys with this value
+   * and invalidate when it changes.
+   */
+  public long getPolicyCacheVersion() {
+    return policyCacheVersion.get();
   }
 
   @Override
@@ -346,6 +362,7 @@ public class DataHubAuthorizer implements Authorizer {
     private final Map<String, List<DataHubPolicyInfo>> policyCache;
     private final Lock writeLock;
     private final int count;
+    private final AtomicLong policyCacheVersion;
 
     @Override
     public void run() {
@@ -382,6 +399,8 @@ public class DataHubAuthorizer implements Authorizer {
           // To unlock the acquired write thread
           writeLock.unlock();
         }
+
+        policyCacheVersion.incrementAndGet();
 
         log.debug("Successfully fetched {} policies.", total);
       } catch (Exception e) {

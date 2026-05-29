@@ -32,6 +32,8 @@ import com.linkedin.metadata.query.filter.Criterion;
 import com.linkedin.metadata.query.filter.CriterionArray;
 import com.linkedin.metadata.query.filter.Filter;
 import com.linkedin.metadata.query.filter.SortCriterion;
+import com.datahub.authorization.config.ViewAuthorizationConfiguration;
+import com.linkedin.metadata.search.auth.SearchPolicyTranslator;
 import com.linkedin.metadata.search.elasticsearch.index.MappingsBuilder;
 import com.linkedin.metadata.search.elasticsearch.query.filter.QueryFilterRewriteChain;
 import com.linkedin.metadata.search.elasticsearch.query.filter.QueryFilterRewriterContext;
@@ -103,6 +105,17 @@ public class ESUtils {
   @Nullable
   public static LifecycleStageTypeService getLifecycleStageTypeService() {
     return lifecycleStageTypeService;
+  }
+
+  // Singleton translator used by applyAuthorizationFilter. Lazy so test-time entrypoints that
+  // never invoke search-time auth filtering pay nothing for it. Behind a holder for thread-safe
+  // initialisation without explicit synchronization.
+  private static final class TranslatorHolder {
+    static final SearchPolicyTranslator INSTANCE = new SearchPolicyTranslator();
+  }
+
+  static SearchPolicyTranslator getSearchPolicyTranslator() {
+    return TranslatorHolder.INSTANCE;
   }
 
   private static final String DEFAULT_SEARCH_RESULTS_SORT_BY_FIELD = "urn";
@@ -1173,7 +1186,77 @@ public class ESUtils {
         filterQuery,
         opContext.getSearchContext().getSearchFlags(),
         hiddenLifecycleStageUrns);
+    applyAuthorizationFilter(opContext, entityNames, filterQuery);
     return filterQuery;
+  }
+
+  /**
+   * Injects an authorization clause derived from the actor's policies into the search filter, when
+   * search-filtering is enabled and the actor is not the system actor. Non-translatable policies
+   * (and clause-budget overflow) fall back to a permissive pre-filter; the post-filter pass run by
+   * {@code ESAccessControlUtil} is responsible for catching anything the pre-filter let through.
+   *
+   * <p>With the feature flag off, with the system actor, or when the requested surface is opted
+   * out via {@code authorization.view.searchFiltering.surfaces.search}, this method is a no-op.
+   */
+  static void applyAuthorizationFilter(
+      @Nonnull OperationContext opContext,
+      @Nonnull List<String> entityNames,
+      @Nonnull BoolQueryBuilder filterQuery) {
+    final ViewAuthorizationConfiguration viewConfig =
+        opContext.getOperationContextConfig().getViewAuthorizationConfiguration();
+    if (viewConfig == null || !viewConfig.isEnabled()) {
+      return;
+    }
+    final ViewAuthorizationConfiguration.SearchFilteringConfig sfc = viewConfig.getSearchFiltering();
+    if (sfc == null || !sfc.isEnabled()) {
+      return;
+    }
+    if (sfc.getSurfaces() != null && !sfc.getSurfaces().isSearch()) {
+      // Surface explicitly opted out (e.g. lineage runs through a different gate).
+      return;
+    }
+    if (opContext.isSystemAuth()) {
+      return;
+    }
+
+    final int maxClauses = sfc.getMaxBoolClauses() > 0 ? sfc.getMaxBoolClauses() : 1024;
+
+    final SearchPolicyTranslator.Result translation;
+    try {
+      translation = getSearchPolicyTranslator().translate(opContext, maxClauses);
+    } catch (RuntimeException e) {
+      log.warn(
+          "applyAuthorizationFilter: translator threw; falling back per onClauseOverflow", e);
+      handleOverflow(sfc);
+      return;
+    }
+
+    if (translation.isOverflow()) {
+      handleOverflow(sfc);
+      return;
+    }
+
+    if (translation.getQuery() != null) {
+      filterQuery.filter(translation.getQuery());
+    }
+    // If query == null && grantsAnything, no constraint is added (post-filter still runs).
+    // If query == null && !grantsAnything, that should have been turned into a deny-all by
+    // SearchPolicyTranslator.denyAll() upstream.
+  }
+
+  private static void handleOverflow(
+      @Nonnull ViewAuthorizationConfiguration.SearchFilteringConfig sfc) {
+    final ViewAuthorizationConfiguration.SearchFilteringConfig.OverflowStrategy strategy =
+        sfc.resolvedOverflow();
+    if (strategy
+        == ViewAuthorizationConfiguration.SearchFilteringConfig.OverflowStrategy.FAIL_CLOSED) {
+      throw new IllegalStateException(
+          "Search authorization filter exceeded maxBoolClauses="
+              + sfc.getMaxBoolClauses()
+              + " and onClauseOverflow=failClosed; rejecting the request");
+    }
+    // postFilter: do nothing here — ESAccessControlUtil's per-hit filter will tighten the result.
   }
 
   /**

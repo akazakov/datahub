@@ -1,0 +1,18 @@
+namespace com.linkedin.restricted
+
+/**
+ * Key for a Restricted entity.
+ *
+ * A Restricted entity is a placeholder URN minted by RestrictedService.encryptRestrictedUrn for
+ * cases where an actor lacks view permission on the underlying entity. The encrypted id is the
+ * encrypted form of the source URN so that the round-trip back to the real entity stays internal.
+ */
+@Aspect = {
+  "name": "restrictedKey"
+}
+record RestrictedKey {
+  /**
+   * An encrypted identifier for the underlying entity whose metadata is being restricted.
+   */
+  id: string
+}

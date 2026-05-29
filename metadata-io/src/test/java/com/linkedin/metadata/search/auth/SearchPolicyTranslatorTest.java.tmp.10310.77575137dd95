@@ -1,0 +1,230 @@
+package com.linkedin.metadata.search.auth;
+
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertFalse;
+import static org.testng.Assert.assertNotNull;
+import static org.testng.Assert.assertNull;
+import static org.testng.Assert.assertTrue;
+
+import com.datahub.authentication.Actor;
+import com.datahub.authentication.ActorType;
+import com.datahub.authentication.Authentication;
+import com.datahub.plugins.auth.authorization.Authorizer;
+import com.linkedin.common.urn.Urn;
+import com.linkedin.common.urn.UrnUtils;
+import com.linkedin.data.template.StringArray;
+import com.linkedin.metadata.authorization.PoliciesConfig;
+import com.linkedin.policy.DataHubActorFilter;
+import com.linkedin.policy.DataHubPolicyInfo;
+import com.linkedin.policy.DataHubResourceFilter;
+import com.linkedin.policy.PolicyMatchCondition;
+import com.linkedin.policy.PolicyMatchCriterion;
+import com.linkedin.policy.PolicyMatchCriterionArray;
+import com.linkedin.policy.PolicyMatchFilter;
+import io.datahubproject.metadata.context.ActorContext;
+import io.datahubproject.metadata.context.AuthorizationContext;
+import io.datahubproject.metadata.context.OperationContext;
+import java.util.Collections;
+import java.util.List;
+import java.util.Set;
+import org.opensearch.index.query.BoolQueryBuilder;
+import org.testng.annotations.Test;
+
+/**
+ * Behavioural tests for {@link SearchPolicyTranslator}. We avoid asserting on exact ES query JSON
+ * — that would tie the test to OpenSearch implementation details — and instead focus on the
+ * decisions the translator makes: which policies it keeps, which it drops as non-translatable,
+ * and how it sets the {@link SearchPolicyTranslator.Result} fields.
+ */
+public class SearchPolicyTranslatorTest {
+
+  private static final Urn TEST_USER = UrnUtils.getUrn("urn:li:corpuser:translator-test");
+  private static final Urn TEST_GROUP = UrnUtils.getUrn("urn:li:corpGroup:engineering");
+  private static final Urn DOMAIN_A = UrnUtils.getUrn("urn:li:domain:A");
+
+  @Test
+  public void emptyPolicySetDeniesAll() {
+    final OperationContext opContext = mockOpContext(Collections.emptySet(), Collections.emptyList());
+    final SearchPolicyTranslator.Result result =
+        new SearchPolicyTranslator().translate(opContext, 1024);
+    // With nothing to match, the actor should see nothing — translator emits a deny-all clause.
+    assertNotNull(result.getQuery(), "deny-all should be a real query, not null");
+    assertFalse(result.isGrantsAnything());
+    assertFalse(result.isHasNonTranslatable());
+  }
+
+  @Test
+  public void inactivePolicyIsSkipped() {
+    final DataHubPolicyInfo policy = baseMetadataPolicy();
+    policy.setState(PoliciesConfig.INACTIVE_POLICY_STATE);
+    final OperationContext opContext = mockOpContext(Set.of(policy), Collections.emptyList());
+    final SearchPolicyTranslator.Result result =
+        new SearchPolicyTranslator().translate(opContext, 1024);
+    // The only candidate policy is inactive; effectively deny-all.
+    assertFalse(result.isGrantsAnything());
+  }
+
+  @Test
+  public void platformPolicyIsSkipped() {
+    final DataHubPolicyInfo policy = baseMetadataPolicy();
+    policy.setType(PoliciesConfig.PLATFORM_POLICY_TYPE);
+    final OperationContext opContext = mockOpContext(Set.of(policy), Collections.emptyList());
+    final SearchPolicyTranslator.Result result =
+        new SearchPolicyTranslator().translate(opContext, 1024);
+    // Platform policies don't gate resource access; translator ignores them.
+    assertFalse(result.isGrantsAnything());
+  }
+
+  @Test
+  public void resourceFilterOnDomainTranslates() {
+    final DataHubPolicyInfo policy = baseMetadataPolicy();
+    policy.setResources(filterOnly(criterion("DOMAIN", PolicyMatchCondition.EQUALS, DOMAIN_A.toString())));
+    final OperationContext opContext = mockOpContext(Set.of(policy), Collections.emptyList());
+    final SearchPolicyTranslator.Result result =
+        new SearchPolicyTranslator().translate(opContext, 1024);
+    assertTrue(result.isGrantsAnything());
+    assertFalse(result.isHasNonTranslatable());
+    assertNotNull(result.getQuery());
+    assertTrue(result.getClauseCount() >= 1);
+  }
+
+  @Test
+  public void unknownFieldDropsPolicyAsNonTranslatable() {
+    final DataHubPolicyInfo policy = baseMetadataPolicy();
+    policy.setResources(
+        filterOnly(criterion("STRUCTURED_PROPERTY", PolicyMatchCondition.EQUALS, "foo")));
+    final OperationContext opContext = mockOpContext(Set.of(policy), Collections.emptyList());
+    final SearchPolicyTranslator.Result result =
+        new SearchPolicyTranslator().translate(opContext, 1024);
+    assertTrue(result.isHasNonTranslatable());
+    assertFalse(result.isGrantsAnything());
+    // Post-filter only: no pre-filter query.
+    assertNull(result.getQuery());
+  }
+
+  @Test
+  public void mixedTranslatableAndNotInSamePolicyDropsThePolicy() {
+    final DataHubPolicyInfo policy = baseMetadataPolicy();
+    final PolicyMatchCriterionArray criteria = new PolicyMatchCriterionArray();
+    criteria.add(criterion("DOMAIN", PolicyMatchCondition.EQUALS, DOMAIN_A.toString()));
+    criteria.add(criterion("STRUCTURED_PROPERTY", PolicyMatchCondition.EQUALS, "foo"));
+    policy.setResources(filterOnly(criteria));
+    final OperationContext opContext = mockOpContext(Set.of(policy), Collections.emptyList());
+    final SearchPolicyTranslator.Result result =
+        new SearchPolicyTranslator().translate(opContext, 1024);
+    // One bad criterion poisons the entire policy: pre-filter sees nothing translatable.
+    assertTrue(result.isHasNonTranslatable());
+    assertFalse(result.isGrantsAnything());
+  }
+
+  @Test
+  public void resourceOwnersExpandsActorAndGroups() {
+    final DataHubPolicyInfo policy = baseMetadataPolicy();
+    final DataHubActorFilter actorFilter = new DataHubActorFilter();
+    actorFilter.setResourceOwners(true);
+    policy.setActors(actorFilter);
+    // No resource filter: only the owners clause should drive the per-policy must-list.
+    policy.setResources(new DataHubResourceFilter());
+    final OperationContext opContext = mockOpContext(Set.of(policy), List.of(TEST_GROUP));
+    final SearchPolicyTranslator.Result result =
+        new SearchPolicyTranslator().translate(opContext, 1024);
+    assertTrue(result.isGrantsAnything());
+    assertFalse(result.isHasNonTranslatable());
+    assertNotNull(result.getQuery());
+  }
+
+  @Test
+  public void allowAllPolicyShortCircuitsToPermissivePreFilter() {
+    final DataHubPolicyInfo policy = baseMetadataPolicy();
+    // No resource filter at all: this policy grants everything.
+    policy.setResources(null);
+    final OperationContext opContext = mockOpContext(Set.of(policy), Collections.emptyList());
+    final SearchPolicyTranslator.Result result =
+        new SearchPolicyTranslator().translate(opContext, 1024);
+    assertTrue(result.isGrantsAnything());
+    // Match-all short-circuit: no pre-filter constraint added.
+    assertNull(result.getQuery());
+    assertFalse(result.isOverflow());
+  }
+
+  @Test
+  public void clauseBudgetOverflowTriggersOverflowFlag() {
+    final DataHubPolicyInfo policy = baseMetadataPolicy();
+    policy.setResources(filterOnly(criterion("DOMAIN", PolicyMatchCondition.EQUALS, DOMAIN_A.toString())));
+    final OperationContext opContext = mockOpContext(Set.of(policy), Collections.emptyList());
+    // maxBoolClauses=0 forces immediate overflow on the first clause.
+    final SearchPolicyTranslator.Result result =
+        new SearchPolicyTranslator().translate(opContext, 0);
+    assertTrue(result.isOverflow());
+    assertTrue(result.isHasNonTranslatable(), "overflow should leave the post-filter as the safety net");
+  }
+
+  @Test
+  public void cacheReturnsSameInstanceWithinVersion() {
+    final DataHubPolicyInfo policy = baseMetadataPolicy();
+    policy.setResources(filterOnly(criterion("DOMAIN", PolicyMatchCondition.EQUALS, DOMAIN_A.toString())));
+    final OperationContext opContext = mockOpContext(Set.of(policy), Collections.emptyList());
+    final SearchPolicyTranslator translator = new SearchPolicyTranslator();
+    final SearchPolicyTranslator.Result a = translator.translate(opContext, 1024);
+    final SearchPolicyTranslator.Result b = translator.translate(opContext, 1024);
+    assertEquals(a, b);
+  }
+
+  // --- helpers -----------------------------------------------------------------------------------
+
+  private static DataHubPolicyInfo baseMetadataPolicy() {
+    final DataHubPolicyInfo p = new DataHubPolicyInfo();
+    p.setType(PoliciesConfig.METADATA_POLICY_TYPE);
+    p.setState(PoliciesConfig.ACTIVE_POLICY_STATE);
+    p.setDisplayName("test");
+    p.setDescription("test");
+    p.setPrivileges(new StringArray(List.of("VIEW_ENTITY_PAGE")));
+    final DataHubActorFilter actorFilter = new DataHubActorFilter();
+    actorFilter.setAllUsers(true);
+    p.setActors(actorFilter);
+    return p;
+  }
+
+  private static DataHubResourceFilter filterOnly(PolicyMatchCriterion criterion) {
+    return filterOnly(new PolicyMatchCriterionArray(List.of(criterion)));
+  }
+
+  private static DataHubResourceFilter filterOnly(PolicyMatchCriterionArray criteria) {
+    final DataHubResourceFilter resources = new DataHubResourceFilter();
+    final PolicyMatchFilter filter = new PolicyMatchFilter();
+    filter.setCriteria(criteria);
+    resources.setFilter(filter);
+    return resources;
+  }
+
+  private static PolicyMatchCriterion criterion(
+      String field, PolicyMatchCondition condition, String value) {
+    final PolicyMatchCriterion c = new PolicyMatchCriterion();
+    c.setField(field);
+    c.setCondition(condition);
+    c.setValues(new com.linkedin.data.template.StringArray(List.of(value)));
+    return c;
+  }
+
+  private static OperationContext mockOpContext(
+      Set<DataHubPolicyInfo> policies, List<Urn> groups) {
+    final OperationContext opContext = mock(OperationContext.class);
+    final ActorContext actorContext = mock(ActorContext.class);
+    final AuthorizationContext authorizationContext = mock(AuthorizationContext.class);
+    final Authorizer authorizer = mock(Authorizer.class);
+    final Authentication auth = new Authentication(new Actor(ActorType.USER, TEST_USER.getId()), "");
+
+    when(opContext.getSessionActorContext()).thenReturn(actorContext);
+    when(opContext.getAuthorizationContext()).thenReturn(authorizationContext);
+    when(actorContext.getActorUrn()).thenReturn(TEST_USER);
+    when(actorContext.getAuthentication()).thenReturn(auth);
+    when(authorizationContext.getAuthorizer()).thenReturn(authorizer);
+    when(authorizer.getActorPolicies(any())).thenReturn(policies);
+    when(authorizer.getActorGroups(any())).thenReturn(groups);
+    when(authorizer.getPolicyCacheVersion()).thenReturn(1L);
+    return opContext;
+  }
+}

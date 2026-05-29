@@ -86,4 +86,14 @@ public interface Authorizer extends Plugin {
   default Collection<Urn> getActorPeers(@Nonnull Urn actorUrn) {
     return Collections.emptyList();
   }
+
+  /**
+   * Monotonic version stamp that increases whenever the policy set this Authorizer reports may have
+   * changed. Caches that key on (actor, policy snapshot) can pair their keys with this value and
+   * invalidate when it changes. Returns 0 by default for authorizers that do not maintain a
+   * refreshable policy cache.
+   */
+  default long getPolicyCacheVersion() {
+    return 0L;
+  }
 }

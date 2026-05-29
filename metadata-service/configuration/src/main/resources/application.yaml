@@ -97,6 +97,28 @@ authorization:
     recommendations:
       # Currently limited to the actor only, see TODO: DataHubAuthorizer
       peerGroupEnabled: ${VIEW_AUTHORIZATION_RECOMMENDATIONS_PEER_GROUP_ENABLED:true}
+    # Search-time permission filtering. With this off, search/autocomplete/browse return
+    # the historical result set byte-for-byte (entity-page authorization, controlled by
+    # view.enabled above, still applies). With this on AND view.enabled, search-side
+    # surfaces enforce per-actor policies — either by dropping unauthorized hits (filter
+    # mode) or by rewriting them to urn:li:restricted:* placeholders (redact mode).
+    # System actors (opContext.isSystemAuth()) bypass both paths.
+    searchFiltering:
+      enabled: ${SEARCH_AUTHORIZATION_FILTERING_ENABLED:false}
+      mode: ${SEARCH_AUTHORIZATION_FILTERING_MODE:filter} # filter | redact
+      surfaces:
+        search: ${SEARCH_AUTH_FILTER_SEARCH:true}
+        autocomplete: ${SEARCH_AUTH_FILTER_AUTOCOMPLETE:true}
+        browse: ${SEARCH_AUTH_FILTER_BROWSE:true}
+        recommendations: ${SEARCH_AUTH_FILTER_RECOMMENDATIONS:true}
+        lineage: ${SEARCH_AUTH_FILTER_LINEAGE:true}
+      # Maximum bool clause count for the synthesised auth filter. ES default is 1024 in
+      # 7.x and 4096 in 8.x. If the translated query exceeds this we fall back per
+      # onClauseOverflow.
+      maxBoolClauses: ${SEARCH_AUTH_FILTER_MAX_CLAUSES:1024}
+      # postFilter: skip the pre-filter, drop unauthorized in the post-filter (safe default).
+      # failClosed: return an error rather than degrading.
+      onClauseOverflow: ${SEARCH_AUTH_FILTER_OVERFLOW:postFilter}
 
 ingestion:
   # The value of cliVersion is substituted in by the processResources Gradle task.

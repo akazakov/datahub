@@ -1,5 +1,7 @@
 package com.linkedin.metadata.recommendation.candidatesource;
 
+import com.datahub.authorization.AuthUtil;
+import com.datahub.authorization.config.ViewAuthorizationConfiguration;
 import com.linkedin.common.urn.Urn;
 import com.linkedin.common.urn.UrnUtils;
 import com.linkedin.metadata.entity.EntityService;
@@ -36,6 +38,33 @@ public interface EntityRecommendationSource extends RecommendationSource {
             .collect(Collectors.toList());
     Set<Urn> existingNonRemoved = entityService.exists(opContext, entities, false);
 
-    return entities.stream().filter(existingNonRemoved::contains).map(this::buildContent);
+    return entities.stream()
+        .filter(existingNonRemoved::contains)
+        .filter(urn -> isViewable(opContext, urn))
+        .map(this::buildContent);
+  }
+
+  /**
+   * True when the actor is allowed to view the candidate. Returns true (no-op) when search-side
+   * authorization filtering is disabled or when the actor is the system actor. Prevents
+   * recommendations from surfacing entities the actor cannot see on the entity page.
+   */
+  static boolean isViewable(@Nonnull OperationContext opContext, @Nonnull Urn urn) {
+    final ViewAuthorizationConfiguration viewConfig =
+        opContext.getOperationContextConfig().getViewAuthorizationConfiguration();
+    if (viewConfig == null || !viewConfig.isEnabled()) {
+      return true;
+    }
+    final ViewAuthorizationConfiguration.SearchFilteringConfig sfc = viewConfig.getSearchFiltering();
+    if (sfc == null || !sfc.isEnabled()) {
+      return true;
+    }
+    if (sfc.getSurfaces() != null && !sfc.getSurfaces().isRecommendations()) {
+      return true;
+    }
+    if (opContext.isSystemAuth()) {
+      return true;
+    }
+    return AuthUtil.canViewEntity(opContext, urn);
   }
 }

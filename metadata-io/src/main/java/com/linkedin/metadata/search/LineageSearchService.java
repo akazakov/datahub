@@ -5,10 +5,12 @@ import static com.linkedin.metadata.Constants.*;
 import static com.linkedin.metadata.search.utils.QueryUtils.buildFilterWithUrns;
 import static com.linkedin.metadata.search.utils.SearchUtils.applyDefaultSearchFlags;
 
+import com.datahub.authorization.config.ViewAuthorizationConfiguration;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
+import com.linkedin.common.UrnArray;
 import com.linkedin.common.UrnArrayArray;
 import com.linkedin.common.urn.Urn;
 import com.linkedin.common.urn.UrnUtils;
@@ -697,22 +699,7 @@ public class LineageSearchService {
       @Nullable LineageRelationship lineageRelationship) {
     LineageSearchEntity entity = new LineageSearchEntity(searchEntity.data());
     if (lineageRelationship != null) {
-      entity.setPaths(
-          lineageRelationship.getPaths().stream()
-              .filter(
-                  urnArray ->
-                      urnArray.stream()
-                          .allMatch(
-                              urn -> {
-                                if (opContext
-                                    .getOperationContextConfig()
-                                    .getViewAuthorizationConfiguration()
-                                    .isEnabled()) {
-                                  return canViewEntity(opContext, urn);
-                                }
-                                return true;
-                              }))
-              .collect(Collectors.toCollection(UrnArrayArray::new)));
+      entity.setPaths(applyLineagePathAuth(opContext, lineageRelationship.getPaths()));
       entity.setDegree(lineageRelationship.getDegree());
       if (lineageRelationship.hasDegrees()) {
         entity.setDegrees(lineageRelationship.getDegrees());
@@ -722,6 +709,67 @@ public class LineageSearchService {
       entity.setIgnoredAsHop(Boolean.TRUE.equals(lineageRelationship.isIgnoredAsHop()));
     }
     return entity;
+  }
+
+  /**
+   * Applies search-time authorization to a lineage path set. Behaviour depends on
+   * {@code authorization.view.searchFiltering}:
+   *
+   * <ul>
+   *   <li>Disabled or surface opted-out: returns the paths unchanged.
+   *   <li>Filter mode: drops any path containing a node the actor cannot view (legacy behaviour).
+   *   <li>Redact mode: rewrites unauthorized nodes to {@code urn:li:restricted:*} placeholders so
+   *       the graph topology stays intact while the asset's identity is hidden.
+   * </ul>
+   */
+  private UrnArrayArray applyLineagePathAuth(
+      @Nonnull OperationContext opContext, @Nonnull UrnArrayArray paths) {
+    final ViewAuthorizationConfiguration viewConfig =
+        opContext.getOperationContextConfig().getViewAuthorizationConfiguration();
+    if (viewConfig == null || !viewConfig.isEnabled()) {
+      return paths;
+    }
+    final ViewAuthorizationConfiguration.SearchFilteringConfig sfc = viewConfig.getSearchFiltering();
+    final boolean searchFilteringOn = sfc != null && sfc.isEnabled();
+    final boolean surfaceOn =
+        sfc == null || sfc.getSurfaces() == null || sfc.getSurfaces().isLineage();
+    if (!searchFilteringOn || !surfaceOn) {
+      // Legacy path: drop unauthorized paths entirely (the original view-only behaviour).
+      return paths.stream()
+          .filter(urnArray -> urnArray.stream().allMatch(urn -> canViewEntity(opContext, urn)))
+          .collect(Collectors.toCollection(UrnArrayArray::new));
+    }
+
+    if (sfc.resolvedMode() == ViewAuthorizationConfiguration.SearchFilteringConfig.Mode.REDACT) {
+      final io.datahubproject.metadata.services.RestrictedService restrictedService =
+          opContext.getServicesRegistryContext() == null
+              ? null
+              : opContext.getServicesRegistryContext().getRestrictedService();
+      if (restrictedService == null) {
+        // Without a RestrictedService we can't mint placeholder URNs; fall back to filter.
+        return paths.stream()
+            .filter(urnArray -> urnArray.stream().allMatch(urn -> canViewEntity(opContext, urn)))
+            .collect(Collectors.toCollection(UrnArrayArray::new));
+      }
+      final UrnArrayArray rewritten = new UrnArrayArray();
+      for (UrnArray path : paths) {
+        final UrnArray rewrittenPath = new UrnArray();
+        for (Urn urn : path) {
+          if (canViewEntity(opContext, urn)) {
+            rewrittenPath.add(urn);
+          } else {
+            rewrittenPath.add(restrictedService.encryptRestrictedUrn(urn));
+          }
+        }
+        rewritten.add(rewrittenPath);
+      }
+      return rewritten;
+    }
+
+    // Filter mode: drop paths whose nodes the actor cannot all view.
+    return paths.stream()
+        .filter(urnArray -> urnArray.stream().allMatch(urn -> canViewEntity(opContext, urn)))
+        .collect(Collectors.toCollection(UrnArrayArray::new));
   }
 
   /**

@@ -1,14 +1,17 @@
 package com.linkedin.metadata.graph.elastic;
 
+import static com.datahub.authorization.AuthUtil.canViewEntity;
 import static com.linkedin.metadata.aspect.models.graph.Edge.*;
 import static com.linkedin.metadata.graph.elastic.utils.GraphFilterUtils.getUrnStatusFieldName;
 import static com.linkedin.metadata.graph.elastic.utils.GraphFilterUtils.getUrnStatusQuery;
 import static com.linkedin.metadata.utils.CriterionUtils.buildCriterion;
 
+import com.datahub.authorization.config.ViewAuthorizationConfiguration;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.common.collect.ImmutableList;
 import com.linkedin.common.urn.Urn;
+import com.linkedin.metadata.graph.LineageRelationship;
 import com.linkedin.metadata.aspect.models.graph.Edge;
 import com.linkedin.metadata.aspect.models.graph.EdgeUrnType;
 import com.linkedin.metadata.aspect.models.graph.RelatedEntities;
@@ -226,11 +229,14 @@ public class ElasticSearchGraphService implements GraphService, ElasticSearchInd
     count = ConfigUtils.applyLimit(getGraphServiceConfig(), count);
     LineageResponse lineageResponse =
         graphReadDAO.getLineage(opContext, entityUrn, lineageGraphFilters, offset, count, maxHops);
+    final java.util.List<LineageRelationship> filtered =
+        applyLineageAuthFilter(opContext, lineageResponse.getLineageRelationships());
+    final int dropped = lineageResponse.getLineageRelationships().size() - filtered.size();
     return new EntityLineageResult()
-        .setRelationships(new LineageRelationshipArray(lineageResponse.getLineageRelationships()))
+        .setRelationships(new LineageRelationshipArray(filtered))
         .setStart(offset)
         .setCount(count)
-        .setTotal(lineageResponse.getTotal())
+        .setTotal(Math.max(0, lineageResponse.getTotal() - dropped))
         .setPartial(lineageResponse.isPartial());
   }
 
@@ -244,12 +250,49 @@ public class ElasticSearchGraphService implements GraphService, ElasticSearchInd
       int maxHops) {
     LineageResponse lineageResponse =
         graphReadDAO.getImpactLineage(opContext, entityUrn, lineageGraphFilters, maxHops);
+    final java.util.List<LineageRelationship> filtered =
+        applyLineageAuthFilter(opContext, lineageResponse.getLineageRelationships());
+    final int dropped = lineageResponse.getLineageRelationships().size() - filtered.size();
     return new EntityLineageResult()
-        .setRelationships(new LineageRelationshipArray(lineageResponse.getLineageRelationships()))
+        .setRelationships(new LineageRelationshipArray(filtered))
         .setStart(0)
-        .setCount(lineageResponse.getLineageRelationships().size())
-        .setTotal(lineageResponse.getTotal())
+        .setCount(filtered.size())
+        .setTotal(Math.max(0, lineageResponse.getTotal() - dropped))
         .setPartial(lineageResponse.isPartial());
+  }
+
+  /**
+   * Direct-graph-query analogue of LineageSearchService's authorization pass. Drops unauthorized
+   * lineage relationships entirely in filter mode; redact mode is intentionally not implemented
+   * here (the URN-rewriting flow lives in LineageSearchService) — when the operator chooses redact
+   * we still drop here, since the graph-direct API returns raw relationships rather than the
+   * SearchEntity-shaped objects the search-side redact code can mark.
+   */
+  private static java.util.List<LineageRelationship> applyLineageAuthFilter(
+      @Nonnull OperationContext opContext,
+      @Nonnull java.util.List<LineageRelationship> relationships) {
+    final ViewAuthorizationConfiguration viewConfig =
+        opContext.getOperationContextConfig().getViewAuthorizationConfiguration();
+    if (viewConfig == null || !viewConfig.isEnabled()) {
+      return relationships;
+    }
+    final ViewAuthorizationConfiguration.SearchFilteringConfig sfc = viewConfig.getSearchFiltering();
+    if (sfc == null || !sfc.isEnabled()) {
+      return relationships;
+    }
+    if (sfc.getSurfaces() != null && !sfc.getSurfaces().isLineage()) {
+      return relationships;
+    }
+    if (opContext.isSystemAuth()) {
+      return relationships;
+    }
+    final java.util.List<LineageRelationship> out = new java.util.ArrayList<>(relationships.size());
+    for (LineageRelationship rel : relationships) {
+      if (canViewEntity(opContext, rel.getEntity())) {
+        out.add(rel);
+      }
+    }
+    return out;
   }
 
   private static Filter createUrnFilter(@Nonnull final Urn urn) {

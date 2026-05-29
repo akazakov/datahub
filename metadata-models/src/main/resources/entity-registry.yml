@@ -795,6 +795,11 @@ entities:
     keyAspect: dataHubOpenAPISchemaKey
     aspects:
       - systemMetadata
+  - name: restricted
+    doc: Placeholder entity returned in place of an unauthorized hit when search-time authorization redacts a result. The URN's id is the encrypted form of the underlying entity URN; resolving it requires the RestrictedService and the actor's permissions on the source entity.
+    category: internal
+    keyAspect: restrictedKey
+    aspects: []
 events:
 plugins:
   aspectPayloadValidators:

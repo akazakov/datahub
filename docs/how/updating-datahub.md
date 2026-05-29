@@ -58,6 +58,8 @@ Requirements:
 
 - **(Ingestion / dbt)** dbt test assertion entities now emit an `ownership` aspect when the dbt test node has explicit owner metadata (`meta.owner` / `config.meta.owner`).
 
+- **(Authorization / search)** Added opt-in search-time permission filtering. When `authorization.view.enabled=true` and the new flag `authorization.view.searchFiltering.enabled=true` (env `SEARCH_AUTHORIZATION_FILTERING_ENABLED`) are both set, `searchAcrossEntities`, `autocomplete`, `browseV2`, recommendations, and lineage enforce per-actor view policies — either by dropping unauthorized hits (`mode: filter`, default) or rewriting them to `urn:li:restricted:*` placeholders (`mode: redact`). System actors (ingestion, MCP consumers, MCE/MAE consumers) bypass entirely. **Default is OFF**; operators opt in. Tile counts, aggregation buckets, and lineage path counts may decrease once enabled — roll out to staging first. The previously-broken `restricted` entity type is now registered end-to-end so `searchFlags.includeRestricted=true` and the redact path return navigable URNs.
+
 ## v1.6.0
 
 Requirements:

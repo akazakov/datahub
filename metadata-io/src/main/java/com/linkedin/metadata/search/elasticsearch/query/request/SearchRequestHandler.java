@@ -424,6 +424,11 @@ public class SearchRequestHandler extends BaseRequestHandler {
       @Nullable Integer size) {
     int totalCount = (int) searchResponse.getHits().getTotalHits().value;
     Collection<SearchEntity> resultList = getRestrictedResults(opContext, searchResponse);
+    int droppedByAuth = totalCount - resultList.size();
+    // Only credit drops that actually came from post-filter auth (not from ES-side pruning
+    // unrelated to authorization); when shouldRun() is false, droppedByAuth would still equal 0
+    // because the call site can't tell the difference. We use the count delta as a best-effort
+    // adjustment since getRestrictedResults already passed through enforceViewAuthorization.
     SearchResultMetadata searchResultMetadata =
         extractSearchResultMetadata(opContext, searchResponse, filter);
 
@@ -432,7 +437,7 @@ public class SearchRequestHandler extends BaseRequestHandler {
         .setMetadata(searchResultMetadata)
         .setFrom(from)
         .setPageSize(ConfigUtils.applyLimit(searchServiceConfig, size))
-        .setNumEntities(totalCount);
+        .setNumEntities(Math.max(0, totalCount - droppedByAuth));
   }
 
   @WithSpan
@@ -485,9 +490,10 @@ public class SearchRequestHandler extends BaseRequestHandler {
       results.add(entity);
     }
 
-    // Apply access control restrictions while preserving order
-    Collection<SearchEntity> resultList =
-        ESAccessControlUtil.restrictSearchResult(opContext, results);
+    // Apply access control restrictions while preserving order. Filter mode drops; redact mode
+    // rewrites in place; legacy SearchFlags.includeRestricted is honoured when filter mode is off.
+    int droppedByAuth = ESAccessControlUtil.enforceViewAuthorization(opContext, results);
+    Collection<SearchEntity> resultList = results;
 
     SearchResultMetadata searchResultMetadata =
         extractSearchResultMetadata(opContext, searchResponse, filter);
@@ -506,7 +512,7 @@ public class SearchRequestHandler extends BaseRequestHandler {
             .setEntities(new SearchEntityArray(resultList))
             .setMetadata(searchResultMetadata)
             .setPageSize(Math.min(size, totalCount))
-            .setNumEntities(totalCount);
+            .setNumEntities(Math.max(0, totalCount - droppedByAuth));
 
     if (nextScrollId != null) {
       scrollResult.setScrollId(nextScrollId);
@@ -643,7 +649,8 @@ public class SearchRequestHandler extends BaseRequestHandler {
                   }
                 })
             .collect(Collectors.toList());
-    return ESAccessControlUtil.restrictSearchResult(opContext, results);
+    ESAccessControlUtil.enforceViewAuthorization(opContext, results);
+    return results;
   }
 
   @Nonnull
