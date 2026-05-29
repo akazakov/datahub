@@ -254,7 +254,13 @@ public class SearchPolicyTranslator {
       }
     }
 
-    final String keyword = esField.equals(FIELD_ENTITY_TYPE) ? esField : esField + ".keyword";
+    // urn and _entityType are already indexed as keyword (no .keyword sub-field). All other
+    // translatable fields (owners, domains, tags, …) are text with a .keyword sub-field for
+    // exact-match queries.
+    final String keyword =
+        (esField.equals(FIELD_ENTITY_TYPE) || esField.equals(FIELD_URN))
+            ? esField
+            : esField + ".keyword";
 
     switch (criterion.getCondition()) {
       case EQUALS:

@@ -83,7 +83,8 @@ public class SearchPolicyTranslatorTest {
     assertTrue(result.isGrantsAnything());
     assertNotNull(result.getQuery());
     String body = result.getQuery().toString();
-    assertTrue(body.contains("urn.keyword"), body);
+    // urn is already indexed as keyword (no .keyword sub-field), unlike owners/domains/etc.
+    assertTrue(body.contains("\"urn\""), body);
     assertTrue(body.contains(urn), body);
   }
 
